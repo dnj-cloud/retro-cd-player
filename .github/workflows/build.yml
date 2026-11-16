@@ -1,0 +1,157 @@
+name: Build APK
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - name: Create Android project
+        run: |
+          mkdir -p www
+          cp index.html styles.css app.js manifest.json www/
+          cp fix*.js www/
+          npm init -y
+          npm i @capacitor/core@6 @capacitor/cli@6 @capacitor/android@6
+          cat > capacitor.config.json <<'CFG'
+          {"appId":"com.retrocd.player","appName":"RETRO CD","webDir":"www","plugins":{"CapacitorHttp":{"enabled":true}},"android":{"backgroundColor":"#0b0c0e"}}
+          CFG
+          npx cap add android
+          npx cap sync android
+      - name: Add music scanner plugin and audio permission
+        run: |
+          D=android/app/src/main/java/com/retrocd/player
+          sed -i 's#<uses-permission android:name="android.permission.INTERNET" />#&\n    <uses-permission android:name="android.permission.READ_MEDIA_AUDIO" />\n    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="32" />#' android/app/src/main/AndroidManifest.xml
+          grep -c READ_MEDIA_AUDIO android/app/src/main/AndroidManifest.xml
+          cat > $D/MainActivity.java <<'JAVA'
+          package com.retrocd.player;
+          import android.os.Bundle;
+          import com.getcapacitor.BridgeActivity;
+          public class MainActivity extends BridgeActivity {
+            @Override public void onCreate(Bundle b) {
+              registerPlugin(MusicScanPlugin.class);
+              super.onCreate(b);
+            }
+          }
+          JAVA
+          cat > $D/MusicScanPlugin.java <<'JAVA'
+          package com.retrocd.player;
+          import android.content.ContentResolver;
+          import android.content.ContentUris;
+          import android.database.Cursor;
+          import android.graphics.Bitmap;
+          import android.net.Uri;
+          import android.os.Build;
+          import android.provider.MediaStore;
+          import android.util.Base64;
+          import android.util.Size;
+          import com.getcapacitor.JSObject;
+          import com.getcapacitor.PermissionState;
+          import com.getcapacitor.Plugin;
+          import com.getcapacitor.PluginCall;
+          import com.getcapacitor.PluginMethod;
+          import com.getcapacitor.annotation.CapacitorPlugin;
+          import com.getcapacitor.annotation.Permission;
+          import com.getcapacitor.annotation.PermissionCallback;
+          import java.io.ByteArrayOutputStream;
+          import org.json.JSONArray;
+
+          @CapacitorPlugin(name = "MusicScan", permissions = {
+            @Permission(alias = "audio33", strings = {"android.permission.READ_MEDIA_AUDIO"}),
+            @Permission(alias = "audioOld", strings = {"android.permission.READ_EXTERNAL_STORAGE"})
+          })
+          public class MusicScanPlugin extends Plugin {
+            private String alias() { return Build.VERSION.SDK_INT >= 33 ? "audio33" : "audioOld"; }
+
+            @PluginMethod
+            public void scan(PluginCall call) {
+              if (getPermissionState(alias()) != PermissionState.GRANTED) {
+                requestPermissionForAlias(alias(), call, "permDone");
+                return;
+              }
+              doScan(call);
+            }
+
+            @PermissionCallback
+            private void permDone(PluginCall call) {
+              if (getPermissionState(alias()) == PermissionState.GRANTED) doScan(call);
+              else call.reject("denied");
+            }
+
+            private void doScan(final PluginCall call) {
+              new Thread(() -> {
+                try {
+                  Uri u = MediaStore.Audio.Media.EXTERNAL_CONTENT_URI;
+                  String[] p = {MediaStore.Audio.Media._ID, MediaStore.Audio.Media.TITLE, MediaStore.Audio.Media.ARTIST,
+                    MediaStore.Audio.Media.ALBUM, MediaStore.Audio.Media.ALBUM_ID, MediaStore.Audio.Media.DURATION,
+                    MediaStore.Audio.Media.TRACK, MediaStore.Audio.Media.YEAR, MediaStore.Audio.Media.DATA};
+                  String sel = MediaStore.Audio.Media.IS_MUSIC + "!=0 AND " + MediaStore.Audio.Media.DURATION + ">30000";
+                  Cursor c = getContext().getContentResolver().query(u, p, sel, null,
+                    MediaStore.Audio.Media.ALBUM + ", " + MediaStore.Audio.Media.TRACK);
+                  JSONArray arr = new JSONArray();
+                  if (c != null) {
+                    while (c.moveToNext()) {
+                      JSObject o = new JSObject();
+                      o.put("id", c.getLong(0));
+                      o.put("title", c.getString(1));
+                      o.put("artist", c.getString(2));
+                      o.put("album", c.getString(3));
+                      o.put("albumId", c.getLong(4));
+                      o.put("dur", c.getLong(5) / 1000);
+                      o.put("track", c.getInt(6));
+                      o.put("year", c.getInt(7));
+                      o.put("path", c.getString(8));
+                      arr.put(o);
+                    }
+                    c.close();
+                  }
+                  JSObject res = new JSObject();
+                  res.put("tracks", arr);
+                  call.resolve(res);
+                } catch (Exception e) {
+                  call.reject(String.valueOf(e.getMessage()));
+                }
+              }).start();
+            }
+
+            @PluginMethod
+            public void art(final PluginCall call) {
+              final Long id = call.getLong("id");
+              new Thread(() -> {
+                JSObject res = new JSObject();
+                String out = "";
+                try {
+                  if (Build.VERSION.SDK_INT >= 29 && id != null) {
+                    Uri uri = ContentUris.withAppendedId(MediaStore.Audio.Media.EXTERNAL_CONTENT_URI, id);
+                    Bitmap b = getContext().getContentResolver().loadThumbnail(uri, new Size(224, 224), null);
+                    ByteArrayOutputStream bo = new ByteArrayOutputStream();
+                    b.compress(Bitmap.CompressFormat.JPEG, 82, bo);
+                    out = "data:image/jpeg;base64," + Base64.encodeToString(bo.toByteArray(), Base64.NO_WRAP);
+                  }
+                } catch (Exception e) { out = ""; }
+                res.put("art", out);
+                call.resolve(res);
+              }).start();
+            }
+          }
+          JAVA
+          for d in android/app/src/main/res/mipmap-*; do
+            case $d in *anydpi*) ;; *) cp icon-192.png $d/ic_launcher.png; cp icon-192.png $d/ic_launcher_round.png;; esac
+          done
+          rm -rf android/app/src/main/res/mipmap-anydpi-v26
+          npx cap sync android
+      - name: Build debug APK
+        run: cd android && chmod +x gradlew && ./gradlew assembleDebug
+      - uses: actions/upload-artifact@v4
+        with:
+          name: retro-cd-apk
+          path: android/app/build/outputs/apk/debug/app-debug.apk
